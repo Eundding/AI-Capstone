@@ -1,12 +1,19 @@
-import datetime
+""" utils.py
+    utility functions and classes
+    Developed as part of DeepThinking2 project
+    April 2021
+"""
+import datetime 
 import json
 import os
 import sys
 from dataclasses import dataclass
 import math
 import matplotlib.pyplot as plt
+import numpy as np
 import matplotlib.gridspec as gridspec
 from matplotlib.colors import LinearSegmentedColormap
+import torch.nn.functional as F
 
 from easy_to_hard_data import MazeDataset
 import torch
@@ -32,19 +39,9 @@ def get_dataloaders(train_batch_size, test_batch_size, train_maze_size=9, test_m
 
 
 def get_model(model, width, depth):
-    """Function to load the model object
-    input:
-        model:       str, Name of the model
-        width:       int, Width of network
-        depth:       int, Depth of network
-    return:
-        net:         Pytorch Network Object
-    """
     model = model.lower()
     # RecurResNetACT 모델을 직접 반환하도록 수정 (만약 recur_resnet_segment에 RecurResNetACT가 없다면)
     if model == "recur_resnet_act":
-        # num_blocks는 ResNet 계층 구조에 따라 달라질 수 있음. 
-        # 이전 BasicBlock 정의와 RecurResNetACT의 _make_layer를 보면 [2]가 적절할 수 있음.
         net = RecurResNetACT(BasicBlock, [2], depth=depth, width=width) 
     else:
         net = eval(model)(depth=depth, width=width)
@@ -105,26 +102,118 @@ def test(net, testloader, mode, device):
     accuracy = eval(f"test_{mode}")(net, testloader, device)
     return accuracy
 
+def compute_image_entropy(x):
+    x_gray = x.mean(dim=1)  # (B, H, W)
+    b, h, w = x_gray.shape
+    x_flat = x_gray.view(b, -1)
 
-def test_default(net, testloader, device):
+    # 정규화 후 histogram 기반 entropy 계산
+    x_norm = (x_flat - x_flat.min(dim=1, keepdim=True)[0]) / \
+             (x_flat.max(dim=1, keepdim=True)[0] - x_flat.min(dim=1, keepdim=True)[0] + 1e-8)
+
+    entropies = []
+    for i in range(b):
+        hist = torch.histc(x_norm[i], bins=32, min=0.0, max=1.0)
+        hist /= hist.sum() + 1e-8
+        entropy = -torch.sum(hist * torch.log(hist + 1e-8))
+        entropies.append(entropy)
+
+    return torch.tensor(entropies, device=x.device)  # shape: [B]
+def set_dynamic_ponder_epsilon(model, inputs, min_eps=0.002, max_eps=0.01):
+    entropies = compute_image_entropy(inputs)  # shape: [B]
+    avg_entropy = entropies.mean().item()
+
+    normalized = np.clip((avg_entropy - 1.5) / (3.5 - 1.5), 0.0, 1.0)
+
+    ponder_epsilon = max_eps - normalized * (max_eps - min_eps)
+    model.ponder_epsilon = ponder_epsilon
+    return ponder_epsilon
+
+
+def test_default(net, testloader, device, tta_steps=5, lr=1e-2, title="Halting Step Distribution (Test)", save_dir="./hist_output"):
     net.eval()
     net.to(device)
+
     correct = 0
     total = 0
+    all_stopped_at_steps = []
+
+    
+    # 여기 주석 풀면 TTA
+    # for param in net.parameters():
+    #     param.requires_grad = False
+    # for param in net.halting_unit.parameters():
+    #     param.requires_grad = True
+
+    # optimizer = torch.optim.Adam(net.halting_unit.parameters(), lr=lr)
+    
+    # for inputs, targets in tqdm(testloader, leave=False):
+    #     inputs = inputs.to(device)
+    #     targets = targets.to(device).unsqueeze(1).long()  # ONLY for evaluation
+
+    #     net.train()  # halting_unit 업데이트를 위해 train mode
+
+    #     for _ in range(tta_steps):
+    #         weighted_output, ponder_cost = net(inputs)
+    #         probs = F.softmax(weighted_output, dim=1)
+
+    #         # pixel-wise entropy
+    #         entropy_loss = -torch.sum(probs * torch.log(probs + 1e-8), dim=1).mean()
+
+    #         loss = entropy_loss #+ net.time_penalty * ponder_cost.mean()
+
+    #         optimizer.zero_grad()
+    #         loss.backward()
+    #         optimizer.step()
+
+    #         net.eval()
+    #         with torch.no_grad():
+    #             weighted_output, _ = net(inputs)
+    #             predicted = weighted_output.argmax(1) * inputs.max(1)[0]
+    #             correct += torch.amin(predicted == targets.squeeze(1), dim=[1, 2]).sum().item()
+    #             total += targets.size(0)
+
+    #             all_stopped_at_steps.extend(net.stopped_at_step.cpu().tolist())
+
+    # print(f"[Train Epoch] Avg halting steps this epoch: {net.last_num_steps:.2f}")
+
+    
+    # 여기만 주석 풀면 일반 돌리기
 
     with torch.no_grad():
-        for inputs, targets in tqdm(testloader, leave=False):
-            inputs, targets = inputs.to(device), targets.to(device).unsqueeze(1).long()
-            weighted_output, _ = net(inputs) # ACT 출력 처리
-            
+        for batch_idx, (inputs, targets) in enumerate(tqdm(testloader, leave=False)):
+            inputs = inputs.to(device)
+            targets = targets.to(device).unsqueeze(1).long()
+
+            # eps = set_dynamic_ponder_epsilon(net, inputs) # 이건 동적 epsilon
+            # print(f"[Dynamic ε] adjusted to {eps:.5f} based on input complexity")
+
+            weighted_output, _ = net(inputs)
+
             predicted = weighted_output.argmax(1) * inputs.max(1)[0]
-            correct += torch.amin(predicted == targets, dim=[1, 2]).sum().item()
+            correct += torch.amin(predicted == targets.squeeze(1), dim=[1, 2]).sum().item()
             total += targets.size(0)
 
+            all_stopped_at_steps.extend(net.stopped_at_step.cpu().tolist())
+
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # NumPy 배열로 변환
+    steps_array = np.array(all_stopped_at_steps)
+    
+    # 저장 (npy + txt)
+    np.save(os.path.join(save_dir, "halting_steps.npy"), steps_array) # 급하게 돌려본거라 돌리고나서 size랑 모델 이름에 넣어서 바꿔줘야함!!!!
+    print(f"[Train Epoch] Avg halting steps this epoch: {net.last_num_steps:.2f}")
     accuracy = 100.0 * correct / total
-    return accuracy
+    print(f"[Test] Accuracy: {accuracy:.2f}%")
+    
 
 def visualize_single_sample(weighted_output, input_img, weighted_output_history, target, batch_idx, sample_type, cmap="magma", max_cols = 5, save_path = './iter_img'):
+    """
+    input_img: [C, H, W] (torch.Tensor, C=3 for RGB or 1 for grayscale)
+    target: [H, W] (torch.Tensor)
+    weighted_output_history: list of [2, H, W] tensors (for a single sample)
+    """
     os.makedirs(save_path, exist_ok = True)
     
     # 현재 시각을 문자열로 생성
@@ -306,9 +395,6 @@ def train_default(net, trainloader, optimizer_obj, device):
     total_ponder_cost = 0  # Ponder cost 추적 추가
     
     torch.set_printoptions(profile="full")
-
-    print('ponder_epsilon:', net.ponder_epsilon)
-    print('time_penalty: ', time_penalty)
 
     for batch_idx, (inputs, targets) in enumerate(tqdm(trainloader, leave=False)):
         inputs, targets = inputs.to(device), targets.to(device).unsqueeze(1).long()

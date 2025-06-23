@@ -1,8 +1,3 @@
-""" utils.py
-    utility functions and classes
-    Developed as part of DeepThinking2 project
-    April 2021
-"""
 import datetime 
 import json
 import os
